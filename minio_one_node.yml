@@ -1,0 +1,142 @@
+# ansible-playbook playbooks/ferramentas/minio.yml -t minio
+---
+- hosts: minio_servers
+  remote_user: root
+  vars:
+    bucket_name: "{{ bucket_name | default('typebot') }}"
+    user_name: "{{ user_name | default('sdesopuser') }}"
+    group_name: "{{ group_name | default('sdesopgroup') }}"
+    SERVER_IP: "{{ item.ansible_default_ipv4.address }}"
+    PORTA_EXPOSTA_CONSOLE_NODE1: "8001"
+    PORTA_EXPOSTA_CONSOLE_NODE2: "8002"
+    PORTA_EXPOSTA_CONSOLE_NODE3: "8003"
+    PORTA_EXPOSTA_CONSOLE_NODE4: "8004"
+    MINIO_MASTER_NODE: "{{ minio_nodes[0].name }}"
+    minio_env:
+      MINIO_ROOT_USER: "admin"
+      MINIO_ROOT_PASSWORD: "33pnx01J7Y"
+    minio_nodes:
+      - name: minio-node1
+        ports:
+          - "{{ PORTA_EXPOSTA_CONSOLE_NODE1 }}:9001"
+      - name: minio-node2
+        ports:
+          - "{{ PORTA_EXPOSTA_CONSOLE_NODE2 }}:9001"
+      - name: minio-node3
+        ports:
+          - "{{ PORTA_EXPOSTA_CONSOLE_NODE3 }}:9001"
+      - name: minio-node4
+        ports:
+          - "{{ PORTA_EXPOSTA_CONSOLE_NODE4 }}:9001"
+    minio_cluster_addresses: http://minio-node{1...4}:9000/data
+
+  roles:
+    - role: docker
+      environment: "{{ proxy_env }}"
+      tags:
+        - docker
+
+  tasks:
+    - name: Testar conectividade com o host
+      ping:
+      tags:
+        - connectivity_test
+
+    - name: Obter tempo de atividade do host
+      command: uptime
+      register: uptime_result
+      tags:
+        - connectivity_test
+
+    - name: Mostrar resultado do tempo de atividade
+      debug:
+        var: uptime_result.stdout
+      tags:
+        - connectivity_test
+
+    - name: Inicializar MinIO servers
+      docker_container:
+        name: "{{ item.name }}"
+        image: minio/minio:latest
+        restart: yes
+        network_mode: bridge
+        networks:
+        - name: minio
+        env: "{{ minio_env }}"
+        ports: "{{ item.ports }}"
+        command: minio server --address ":9000" --console-address ":9001" {{ minio_cluster_addresses }}
+      loop: "{{ minio_nodes }}"
+      tags:
+        - minio
+
+    - name: Configurar alias MinIO
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc alias set {{ item.name }} http://{{ SERVER_IP }}:{{ item.ports[0].split(':')[0] }} {{ minio_env.MINIO_ROOT_USER }} {{ minio_env.MINIO_ROOT_PASSWORD }}
+      with_items: "{{ minio_nodes }}"
+      tags:
+        - enable_replication
+
+    - name: Adicionar replicação MinIO se não existir
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc admin replicate add {{ minio_nodes[0].name }} {{ minio_nodes[1].name }}
+      when: "replication_check.results[0].stderr.find('No site replication configured') != -1"
+      tags:
+        - enable_replication
+
+    - name: Verificar replicação existente
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc admin replicate list {{ item.name }}
+      register: replication_check
+      ignore_errors: yes
+      with_items: "{{ minio_nodes }}"
+      tags:
+        - check_replication
+
+    - name: Listar alias MinIO
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc alias ls
+      tags:
+        - enable_replication
+
+    - name: Criar buckets no MinIO
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc config host add minio http://localhost:9000 {{ minio_env.MINIO_ROOT_USER }} {{ minio_env.MINIO_ROOT_PASSWORD }}
+        docker exec {{ MINIO_MASTER_NODE }} mc mb minio/{{ bucket_name }}
+        docker exec {{ MINIO_MASTER_NODE }} mc policy set public minio/{{ bucket_name }}
+      tags:
+        - create_bucket
+
+    - name: Gerar password aleatório
+      shell: >
+        cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1
+      register: random_password
+      tags:
+        - create_access_key
+
+    - name: Exibir senha gerada
+      debug:
+        msg: "Senha gerada: {{ random_password.stdout }}"
+      tags:
+        - create_access_key        
+
+    - name: Criar access key no MinIO
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc admin user add minio {{ user_name }} "{{ random_password.stdout }}"
+      tags:
+        - create_access_key
+
+    - name: Criar um grupo no MinIO
+      shell: |
+        docker exec {{ MINIO_MASTER_NODE }} mc admin group add minio {{ group_name }} {{ user_name }}
+        docker exec {{ MINIO_MASTER_NODE }} mc admin policy attach minio readwrite --group {{ group_name }}
+      args:
+        executable: /bin/bash
+      tags:
+        - create_group
+
+    - name: Adicionar grupo ao bucket no MinIO
+      shell: docker exec {{ MINIO_MASTER_NODE }} mc admin policy attach minio/readwrite/{{ group_name }}/{{ bucket_name }}
+      args:
+        executable: /bin/bash
+      tags:
+        - attach_policy
